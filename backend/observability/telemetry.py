@@ -252,6 +252,23 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
     # optimization the moment the configured NVIDIA model changed. Every
     # other provider keeps the original with_structured_output() path.
     is_nvidia_hosted_model = _infer_provider(llm) == "nvidia"
+    # Groq's with_structured_output() defaults to method="function_calling"
+    # (tool calling) for langchain-groq. Confirmed live (2026-09-28) that
+    # openai/gpt-oss-20b sometimes responds with ordinary text instead of
+    # invoking the tool, which Groq then rejects with a 400 "Tool choice is
+    # required, but model did not call a tool" - reproduced on a real E2E
+    # run. Groq's own Structured Output API (method="json_schema", using
+    # constrained decoding rather than tool calling) does not have this
+    # failure mode: 10/10 real trials with the exact same previously-failing
+    # prompt succeeded, plus the real nested PatchResponse/FilePatch schema
+    # and DeveloperResult (which has default-valued fields) both parsed
+    # correctly. strict=True is a documented no-op (never an error) for any
+    # Groq model outside langchain_groq's own
+    # _STRICT_STRUCTURED_OUTPUT_MODELS allowlist, so this is safe to pass
+    # unconditionally rather than needing to special-case the model name
+    # here too. Returns the exact same {"raw","parsed","parsing_error"}
+    # shape as the default method, so nothing below this needs to change.
+    is_groq_hosted_model = _infer_provider(llm) == "groq"
     print(f"[LLM] Requesting structured output for {schema_name} from {model_name}...", flush=True)
     t0 = time.time()
 
@@ -259,7 +276,12 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
         try:
             result = None
             try:
-                structured = llm.with_structured_output(schema, include_raw=True)
+                if is_groq_hosted_model:
+                    structured = llm.with_structured_output(
+                        schema, method="json_schema", strict=True, include_raw=True
+                    )
+                else:
+                    structured = llm.with_structured_output(schema, include_raw=True)
                 result = structured.invoke(prompt)
             except (NotImplementedError, Exception) as inner_exc:
                 if "guided_json" in str(inner_exc) or "[400]" in str(inner_exc):

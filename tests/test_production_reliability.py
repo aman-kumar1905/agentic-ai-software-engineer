@@ -629,7 +629,10 @@ class FakeProviderLLM:
         self.result = result
         self.invocations = 0
 
-    def with_structured_output(self, schema, include_raw=False):
+    def with_structured_output(self, schema, include_raw=False, **kwargs):
+        # **kwargs tolerates provider-specific extras (e.g. Groq's
+        # method="json_schema"/strict=True) the real client accepts but
+        # this generic fake doesn't need to act on.
         return self
 
     def invoke(self, prompt):
@@ -1435,7 +1438,7 @@ class FakeEmptyCompletionLLM:
         self.content = content
         self.invocations = 0
 
-    def with_structured_output(self, schema, include_raw=False):
+    def with_structured_output(self, schema, include_raw=False, **kwargs):
         return self  # invoke() below stands in for structured.invoke(prompt) too
 
     def invoke(self, prompt):
