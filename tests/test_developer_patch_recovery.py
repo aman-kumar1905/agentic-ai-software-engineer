@@ -29,6 +29,8 @@ genuine .py syntax/AST error) is untouched and still raises immediately.
 import os
 import subprocess
 
+import pytest
+
 from backend.developer.models import FilePatch
 from backend.graph.nodes import developer_node, route_after_developer, MAX_REVISIONS
 from backend.schemas.developer import DeveloperResult
@@ -282,4 +284,163 @@ class TestNoOpPatchNotTreatedAsSuccess:
         output = developer_node(state)
         assert output["generated_patches"] == []
         assert "qa_result" not in output
+        assert route_after_developer({**output, "revision_count": 0}) == "qa"
+
+
+# ============================================================================
+# Root cause: developer_node called the context-blind generate_code_changes()
+# (backend/agents/developer.py - a prompt built only from the execution plan
+# and knowledge answer, with no repo_context/file content at all) BEFORE
+# repo_context was even loaded, unconditionally, on every single call - even
+# when the real, context-aware exact-snippet/whole-file patch path below it
+# (the one that actually receives STRUCTURED REPOSITORY CONTEXT and produces
+# generated_patches) succeeded outright. Two problems: (1) a wasted, always-
+# paid-for second LLM round trip, and (2) that blind call's own prompt is so
+# underspecified (no file content, often an empty plan/knowledge) that a
+# real Groq fallback call against it fails with "Tool choice is required,
+# but model did not call a tool" - Groq's gpt-oss-20b declines to invoke the
+# structured-output tool when it has nothing concrete to work with, exactly
+# as observed on a real E2E run.
+#
+# Fix: generate_code_changes() is now called only as the existing fallback
+# path already implied it should be - when the context-aware path produced
+# no patches at all (no repo_context, or a non-recoverable empty result) -
+# never when context-aware patches already exist. The top-level
+# developer_result returned to the caller is now built via the existing
+# _advisory_developer_result() helper (already used by qa_node/revision_node
+# for the same "show the real patch, not the blind placeholder" reason),
+# deriving it from generated_patches instead of a second blind LLM call.
+# ============================================================================
+
+class TestDeveloperNodeDoesNotCallBlindGenerateCodeChangesWhenContextAvailable:
+    def test_context_aware_success_never_invokes_blind_generate_code_changes(self, tmp_path, monkeypatch):
+        """When repo_context is available and the context-aware patch path
+        succeeds, generate_code_changes() must never be called at all."""
+
+        def spy_generate_code_changes(user_request, plan, knowledge):
+            raise AssertionError(
+                "generate_code_changes() (context-blind) must NOT be called "
+                "when the context-aware patch path already produced patches."
+            )
+
+        monkeypatch.setattr("backend.graph.nodes.generate_code_changes", spy_generate_code_changes)
+
+        matching_patch = FilePatch(
+            file_path="README.md",
+            original_code_snippet="# agentic-ai-test-repo",
+            updated_code_snippet="# agentic-ai-test-repo\n\n## E2E Test\n\nVerifies the pipeline.\n",
+            explanation="Add E2E Test section",
+        )
+
+        class _FakePatchResult:
+            patches = [matching_patch]
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.invoke_structured",
+            lambda llm, schema_cls, prompt, *a, **k: _FakePatchResult(),
+        )
+        _real_git_workspace_with_file(tmp_path, monkeypatch, "no-blind-call", "README.md", _REAL_README_CONTENT)
+
+        state = {
+            "user_message": "Add an E2E Test section to README.md",
+            "project_id": "no-blind-call",
+            "repo_context": [
+                CodeChunk(
+                    file_path="README.md", content=_REAL_README_CONTENT,
+                    start_line=1, end_line=1, chunk_type="module",
+                )
+            ],
+        }
+        output = developer_node(state)
+
+        assert len(output["generated_patches"]) == 1
+        # developer_result is now derived from the real patch, not a
+        # separate blind call's placeholder (see _advisory_developer_result).
+        assert output["developer_result"] is not None
+        assert "README.md" in output["developer_result"].summary
+
+    def test_no_repo_context_still_falls_back_to_blind_generate_code_changes(self, monkeypatch):
+        """The blind path must remain available as a genuine fallback when
+        there is truly no repo_context to scan (e.g. a brand-new/empty
+        workspace) - this existing behavior must be unaffected by the fix."""
+        real_result = DeveloperResult(
+            summary="Blind fallback implementation",
+            changes=[],
+            requires_testing=False,
+            notes=[],
+        )
+        calls = []
+
+        def fake_generate_code_changes(user_request, plan, knowledge):
+            calls.append(1)
+            return real_result
+
+        monkeypatch.setattr("backend.graph.nodes.generate_code_changes", fake_generate_code_changes)
+
+        state = {
+            "user_message": "General question with no repository context",
+            "project_id": "no-context-at-all",
+        }
+        output = developer_node(state)
+
+        assert len(calls) == 1, "The blind fallback must still run when repo_context is unavailable."
+        assert output["generated_patches"] == []
+        assert output["developer_result"] is real_result
+
+
+class TestDeveloperNodeE2EReadmeSection:
+    def test_e2e_test_section_patch_generated_from_minimal_real_readme(self, tmp_path, monkeypatch):
+        """The exact production scenario: a repository whose entire README.md
+        is the single line '# agentic-ai-test-repo' (no trailing newline).
+        Requesting an 'E2E Test' section must produce exactly one validated,
+        applied patch via the context-aware path - never a context-blind
+        guess, and never a Groq-hostile empty-context call."""
+
+        def spy_generate_code_changes(user_request, plan, knowledge):
+            raise AssertionError(
+                "The E2E Test section request has real repo_context - the "
+                "context-blind fallback must never run for it."
+            )
+
+        monkeypatch.setattr("backend.graph.nodes.generate_code_changes", spy_generate_code_changes)
+
+        e2e_patch = FilePatch(
+            file_path="README.md",
+            original_code_snippet="# agentic-ai-test-repo",
+            updated_code_snippet=(
+                "# agentic-ai-test-repo\n\n"
+                "## E2E Test\n\n"
+                "This section verifies the autonomous software-engineering "
+                "pipeline and GitHub pull-request workflow.\n"
+            ),
+            explanation="Add E2E Test section documenting the pipeline validation workflow.",
+        )
+
+        class _FakePatchResult:
+            patches = [e2e_patch]
+
+        monkeypatch.setattr(
+            "backend.graph.nodes.invoke_structured",
+            lambda llm, schema_cls, prompt, *a, **k: _FakePatchResult(),
+        )
+        workspace_dir = _real_git_workspace_with_file(
+            tmp_path, monkeypatch, "e2e-readme-section", "README.md", _REAL_README_CONTENT,
+        )
+
+        state = {
+            "user_message": 'Add an "E2E Test" section to README.md',
+            "project_id": "e2e-readme-section",
+            "repo_context": [
+                CodeChunk(
+                    file_path="README.md", content=_REAL_README_CONTENT,
+                    start_line=1, end_line=1, chunk_type="module",
+                )
+            ],
+        }
+        output = developer_node(state)
+
+        assert len(output["generated_patches"]) == 1
+        assert output["generated_patches"][0].file_path == "README.md"
+        written = (workspace_dir / "README.md").read_text(encoding="utf-8")
+        assert "## E2E Test" in written
         assert route_after_developer({**output, "revision_count": 0}) == "qa"

@@ -604,11 +604,18 @@ def developer_node(state: AgentState) -> dict:
         )
 
     with collect_usage() as usage:
-        developer_result = generate_code_changes(
-            user_request=state["user_message"],
-            plan=plan,
-            knowledge=knowledge,
-        )
+        # generate_code_changes() (the context-blind path - see
+        # backend/agents/developer.py) is deliberately NOT called here
+        # unconditionally. It only runs further below, as a genuine
+        # fallback, when the context-aware exact-snippet/whole-file patch
+        # path (below) produced no patches at all - calling it upfront on
+        # every run wasted a second LLM round trip whenever the
+        # context-aware path succeeded, and its own prompt (plan + knowledge
+        # only, no repo_context/file content) is so underspecified that a
+        # real Groq fallback call against it fails with "Tool choice is
+        # required, but model did not call a tool" - the model has nothing
+        # concrete to work with.
+        developer_result = None
 
         repo_context = state.get("repo_context")
 
@@ -805,6 +812,16 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
         # above: that failure is real feedback for the revision loop, and
         # silently replacing it with a fresh blind patch here would erase
         # the classification before route_after_developer ever sees it.
+        # This is also the ONLY place generate_code_changes() (the
+        # context-blind path) is ever called - lazily, only when the
+        # context-aware path above produced nothing to fall back on.
+        if not generated_patches and not recoverable_patch_failure_check:
+            developer_result = generate_code_changes(
+                user_request=state["user_message"],
+                plan=plan,
+                knowledge=knowledge,
+            )
+
         if not generated_patches and not recoverable_patch_failure_check and developer_result and developer_result.changes:
             from backend.developer.patch_scope import PatchWrapperArtifactError
 
@@ -841,7 +858,14 @@ For any file shown above marked [COMPLETE FILE CONTENT - verbatim, nothing omitt
         )
 
     result = {
-        "developer_result": developer_result,
+        # Derived from the real, validated generated_patches whenever they
+        # exist (see _advisory_developer_result) rather than the separate
+        # context-blind developer_result - this is what the HITL approval
+        # payload and the git commit message actually show/use downstream,
+        # so it must describe the patch that was really applied, not an
+        # independent, potentially-unrelated blind guess. Falls back to the
+        # blind developer_result unchanged when there are no generated_patches.
+        "developer_result": _advisory_developer_result(generated_patches, developer_result),
         "plan": plan,
         "generated_patches": generated_patches,
         # Persisted (mirroring knowledge_node's existing behavior) so
