@@ -7,6 +7,26 @@ import subprocess
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_nvidia_resilience_state(monkeypatch):
+    """
+    backend/services/nvidia_resilience.py's concurrency semaphore and
+    circuit breaker are process-local singletons shared across the whole
+    test session. Without this, one test's simulated NVIDIA capacity
+    failures could leave the circuit breaker open (or its bounded retry's
+    real time.sleep() calls slow) for a later, unrelated test. Resets the
+    breaker to a fresh CLOSED state and no-ops the backoff sleep by default
+    for every test; a test that specifically wants to observe real sleep
+    calls or timing can still monkeypatch it back locally.
+    """
+    from backend.services import nvidia_resilience
+
+    nvidia_resilience.nvidia_circuit.reset()
+    monkeypatch.setattr(nvidia_resilience, "sleep", lambda seconds: None)
+    yield
+    nvidia_resilience.nvidia_circuit.reset()
+
+
 @pytest.fixture
 def fake_clone_creates_real_git_repo():
     """

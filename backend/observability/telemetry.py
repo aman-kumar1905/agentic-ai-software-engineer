@@ -144,6 +144,8 @@ def _infer_provider(llm: Any) -> str:
         return "gemini"
     if "openai" in cls_name:
         return "openai"
+    if "groq" in cls_name:
+        return "groq"
     from backend.core.config import LLM_PROVIDER
     return (LLM_PROVIDER or "nvidia").lower()
 
@@ -399,6 +401,85 @@ def _invoke_single_provider(llm: Any, schema: Any, prompt: str) -> Any:
             raise classified
 
 
+def _invoke_nvidia_with_resilience(llm: Any, schema: Any, prompt: str) -> Any:
+    """
+    Wraps _invoke_single_provider with NVIDIA-specific capacity resilience: a
+    process-local concurrency guard bounding simultaneous in-flight NVIDIA
+    requests, a bounded exponential-backoff retry for transient
+    (503/ResourceExhausted) failures, and a circuit breaker that fails fast
+    during a sustained NVIDIA capacity outage instead of continuing to retry
+    into it (see backend/services/nvidia_resilience.py).
+
+    Deliberately scoped to `type(classified) is LLMTransientError` (the
+    generic 5xx/"service unavailable" case), not `isinstance` - a subclass
+    like LLMMalformedResponseError must keep propagating on the first
+    failure exactly as before, unretried here, since a malformed response is
+    a response-quality problem this retry (built for capacity contention)
+    isn't meant to address. Every other classification (timeout, rate
+    limit, auth, invalid request) is untouched and propagates immediately,
+    so invoke_structured's existing primary -> fallback switch is unaffected
+    for those cases.
+    """
+    from backend.services.errors import classify_llm_exception, LLMTransientError
+    from backend.services.nvidia_resilience import (
+        nvidia_semaphore,
+        nvidia_circuit,
+        compute_backoff_delay,
+        sleep as _nvidia_sleep,
+    )
+    from backend.core.config import NVIDIA_MAX_RETRIES
+
+    state = nvidia_circuit.state
+    if not nvidia_circuit.allow_request():
+        print("[LLM] NVIDIA circuit breaker OPEN - failing fast without calling provider", flush=True)
+        raise LLMTransientError(
+            "NVIDIA circuit breaker open - provider capacity outage, failing fast",
+            provider="nvidia",
+        )
+    if state == "HALF_OPEN":
+        print("[LLM] NVIDIA circuit breaker HALF-OPEN - allowing recovery probe request", flush=True)
+
+    with nvidia_semaphore:
+        for attempt in range(NVIDIA_MAX_RETRIES + 1):
+            try:
+                result = _invoke_single_provider(llm, schema, prompt)
+                if nvidia_circuit.record_success():
+                    print("[LLM] NVIDIA circuit breaker CLOSED - provider healthy again", flush=True)
+                return result
+            except Exception as e:
+                classified = classify_llm_exception(e, provider="nvidia")
+                if type(classified) is not LLMTransientError:
+                    raise classified
+                if nvidia_circuit.record_failure():
+                    print(
+                        f"[LLM] NVIDIA circuit breaker OPENED after repeated capacity failures - "
+                        f"cooling down {nvidia_circuit.cooldown_seconds:.0f}s",
+                        flush=True,
+                    )
+                if attempt < NVIDIA_MAX_RETRIES:
+                    delay = compute_backoff_delay(attempt)
+                    print(
+                        f"[LLM] NVIDIA transient capacity failure (503/ResourceExhausted), "
+                        f"retry {attempt + 1}/{NVIDIA_MAX_RETRIES} in {delay:.2f}s...",
+                        flush=True,
+                    )
+                    _nvidia_sleep(delay)
+                    continue
+                print(
+                    f"[LLM] NVIDIA retries exhausted after {NVIDIA_MAX_RETRIES + 1} attempts.",
+                    flush=True,
+                )
+                raise classified
+
+
+def _dispatch_invoke(llm: Any, schema: Any, prompt: str) -> Any:
+    """Routes NVIDIA calls through the capacity-resilience wrapper; every
+    other provider is unaffected and calls _invoke_single_provider directly."""
+    if _infer_provider(llm) == "nvidia":
+        return _invoke_nvidia_with_resilience(llm, schema, prompt)
+    return _invoke_single_provider(llm, schema, prompt)
+
+
 def invoke_structured(
     llm: Any,
     schema: Any,
@@ -438,7 +519,7 @@ def invoke_structured(
 
     # Attempt 1: Primary Provider
     try:
-        return _invoke_single_provider(llm, schema, prompt)
+        return _dispatch_invoke(llm, schema, prompt)
     except Exception as primary_exc:
         elapsed_ms = (time.time() - t0) * 1000.0
         classified_primary = classify_llm_exception(primary_exc, provider=primary_provider)
@@ -536,7 +617,7 @@ def invoke_structured(
 
         t1 = time.time()
         try:
-            result = _invoke_single_provider(fallback_llm, schema, prompt)
+            result = _dispatch_invoke(fallback_llm, schema, prompt)
             print(
                 f"[LLM] Fallback provider '{fallback_provider}' succeeded in {time.time()-t1:.2f}s.",
                 flush=True,
@@ -584,7 +665,7 @@ def invoke_structured(
                     try:
                         second_fallback_llm = get_llm(provider=second_fallback_provider)
                         t2 = time.time()
-                        result = _invoke_single_provider(second_fallback_llm, schema, prompt)
+                        result = _dispatch_invoke(second_fallback_llm, schema, prompt)
                         print(
                             f"[LLM] Second fallback provider '{second_fallback_provider}' "
                             f"succeeded in {time.time()-t2:.2f}s.",

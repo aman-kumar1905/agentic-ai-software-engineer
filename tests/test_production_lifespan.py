@@ -428,10 +428,19 @@ class TestReadinessEndpoint:
         """The new llm_provider diagnostic must make a configured fallback
         visible - and must never gate overall readiness on it, since a
         fallback credential is always optional by design."""
+        import backend.services.llm as llm_module
         monkeypatch.setenv("LLM_PROVIDER", "nvidia")
         monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key")
         monkeypatch.setenv("GOOGLE_API_KEY", "google-test-key")
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        # groq is nvidia's preferred fallback when credentialed (see
+        # backend/services/llm.py's _FALLBACK_ORDER) - cleared here (env AND
+        # the module's own imported constant, since whatever real .env this
+        # suite runs against may have a real GROQ_API_KEY captured at import
+        # time) so this test's target of "gemini specifically" is unaffected
+        # by whichever fallback credentials happen to exist in that .env.
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.setattr(llm_module, "GROQ_API_KEY", None)
         runner = AgentRunner(checkpoint_db_path=temp_workspace["checkpoints_db"])
         app = create_app(runner=runner)
         client = TestClient(app)
@@ -452,10 +461,17 @@ class TestReadinessEndpoint:
         readiness report - the application must never silently pretend it
         has a fallback - but must NOT flip is_ready/status: an
         unconfigured, optional fallback is not a service outage."""
+        import backend.services.llm as llm_module
         monkeypatch.setenv("LLM_PROVIDER", "nvidia")
         monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key")
         monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        # Also clear groq (env AND the module's own imported constant) -
+        # otherwise a real GROQ_API_KEY in whatever .env this suite runs
+        # against would make it "configured" despite this test asserting
+        # no fallback is configured at all. See the sibling test above.
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.setattr(llm_module, "GROQ_API_KEY", None)
         runner = AgentRunner(checkpoint_db_path=temp_workspace["checkpoints_db"])
         app = create_app(runner=runner)
         client = TestClient(app)

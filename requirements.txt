@@ -13,3 +13,4 @@ langgraph-checkpoint-sqlite
 faiss-cpu
 pytest
 langchain-openai
+langchain-groq

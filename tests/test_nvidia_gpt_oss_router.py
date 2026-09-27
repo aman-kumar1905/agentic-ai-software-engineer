@@ -483,7 +483,9 @@ class TestNvidiaGuidedJsonMechanism:
         """End-to-end: the exact 503 from the investigation, hit on the
         primary NVIDIA call, must trigger the same safe provider fallback
         as any other transient failure - not a special case, not silently
-        swallowed."""
+        swallowed. NVIDIA's own bounded capacity-resilience retries
+        (backend/services/nvidia_resilience.py) run first, so the primary
+        is invoked NVIDIA_MAX_RETRIES + 1 times before the switch, not once."""
         decision = RoutingDecision(
             task_type=TaskType.BUG_FIX, requires_planning=False,
             requires_knowledge=False, reasoning="Fallback after 503.",
@@ -512,7 +514,8 @@ class TestNvidiaGuidedJsonMechanism:
         result = invoke_structured(primary, RoutingDecision, "prompt")
 
         assert result == decision
-        assert primary.include_raw_calls == 1
+        from backend.core.config import NVIDIA_MAX_RETRIES
+        assert primary.include_raw_calls == NVIDIA_MAX_RETRIES + 1
 
 
 # ---------------------------------------------------------------------------
@@ -581,12 +584,25 @@ class TestTimeoutClassification:
 # ---------------------------------------------------------------------------
 
 class TestMalformedResponseHandling:
-    def test_empty_completion_from_bind_and_direct_fallback_is_malformed_fast(self):
+    def test_empty_completion_from_bind_and_direct_fallback_is_malformed_fast(self, monkeypatch):
         """Reproduces the EC2 "Write a README..." failure: the schema-guided
         single call comes back empty, and so does the plain direct-invoke
         fallback. Must still raise LLMMalformedResponseError (unchanged
         classification), but after only the bind call + one direct
-        fallback call - never the old 3-format cascade."""
+        fallback call - never the old 3-format cascade.
+
+        Deliberately clears every fallback-eligible provider's credential
+        (both the env var and backend.services.llm's own imported constant -
+        see _set_provider_credentials in test_production_reliability.py for
+        why both are needed) so this test's outcome depends only on the
+        primary's own classification, never on which fallback credentials
+        happen to be present in whatever real .env this suite runs against.
+        """
+        import backend.services.llm as llm_module
+        for env_name, attr_name in [("GOOGLE_API_KEY", "GOOGLE_API_KEY"), ("OPENAI_API_KEY", "OPENAI_API_KEY"), ("GROQ_API_KEY", "GROQ_API_KEY")]:
+            monkeypatch.delenv(env_name, raising=False)
+            monkeypatch.setattr(llm_module, attr_name, None)
+
         llm = FakeNvidiaLLM(bind_content="", direct_content="")
 
         with pytest.raises(LLMMalformedResponseError):

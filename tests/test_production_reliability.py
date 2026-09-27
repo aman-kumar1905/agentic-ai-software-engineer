@@ -701,8 +701,12 @@ def test_provider_timeout_is_structured():
 def test_transient_provider_failure_triggers_fallback(monkeypatch):
     """
     Verifies that a transient provider failure (e.g. 503 Service Unavailable)
-    on the primary provider automatically triggers fallback to the eligible secondary provider.
+    on the primary provider automatically triggers fallback to the eligible secondary provider,
+    after NVIDIA's own bounded capacity-resilience retries (backend/services/nvidia_resilience.py)
+    are exhausted - not on the very first attempt.
     """
+    from backend.core.config import NVIDIA_MAX_RETRIES
+
     primary = FakeProviderLLM(
         provider="nvidia",
         failure=httpx.NetworkError("503 Service Unavailable"),
@@ -723,7 +727,7 @@ def test_transient_provider_failure_triggers_fallback(monkeypatch):
 
     result = invoke_structured(primary, RoutingDecision, "Fix broken endpoint")
     assert result.task_type == TaskType.BUG_FIX
-    assert primary.invocations == 1
+    assert primary.invocations == NVIDIA_MAX_RETRIES + 1
     assert fallback.invocations == 1
 
 
@@ -850,7 +854,8 @@ def test_fallback_is_bounded(monkeypatch):
         invoke_structured(primary, RoutingDecision, "Any prompt")
 
     assert "transient provider failure" in str(exc_info.value).lower() or "502" in str(exc_info.value)
-    assert primary.invocations == 1
+    from backend.core.config import NVIDIA_MAX_RETRIES
+    assert primary.invocations == NVIDIA_MAX_RETRIES + 1
     assert fallback.invocations == 1
     assert len(fallback_attempts) == 1, "Fallback must be attempted at most once (strict bound of 2 attempts)!"
 
@@ -1735,7 +1740,7 @@ def test_malformed_response_fallback_telemetry_category(monkeypatch):
     assert recorded_events[0]["failure_type"] == "LLMMalformedResponseError"
 
 
-def _set_provider_credentials(monkeypatch, nvidia=None, gemini=None, openai=None):
+def _set_provider_credentials(monkeypatch, nvidia=None, gemini=None, openai=None, groq=None):
     """
     Deterministically sets/clears provider credentials for
     get_fallback_provider()'s real (unmocked) credential checks, regardless
@@ -1751,6 +1756,7 @@ def _set_provider_credentials(monkeypatch, nvidia=None, gemini=None, openai=None
         ("NVIDIA_API_KEY", "NVIDIA_API_KEY", nvidia),
         ("GOOGLE_API_KEY", "GOOGLE_API_KEY", gemini),
         ("OPENAI_API_KEY", "OPENAI_API_KEY", openai),
+        ("GROQ_API_KEY", "GROQ_API_KEY", groq),
     ]:
         if value:
             monkeypatch.setenv(env_name, value)
@@ -1758,6 +1764,200 @@ def _set_provider_credentials(monkeypatch, nvidia=None, gemini=None, openai=None
         else:
             monkeypatch.delenv(env_name, raising=False)
             monkeypatch.setattr(llm_module, attr_name, None)
+
+
+# 22b. NVIDIA-only mode: LLM_FALLBACK_ENABLED=false disables fallback
+# entirely, even when other providers are fully credentialed - the
+# existing mechanism a controlled NVIDIA-only E2E smoke test uses.
+@pytest.mark.parametrize("disabled_value", ["false", "0", "no", "False", "NO"])
+def test_get_fallback_provider_disabled_returns_none_even_with_credentials(monkeypatch, disabled_value):
+    """
+    LLM_FALLBACK_ENABLED set to any recognized "off" value must return None
+    from get_fallback_provider() regardless of how many OTHER providers are
+    fully credentialed - this is a deliberate operator override, not a
+    credential-availability check, and must take priority over it.
+    """
+    monkeypatch.setenv("LLM_FALLBACK_ENABLED", disabled_value)
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-primary-key", gemini="google-key", openai="openai-key")
+
+    assert get_fallback_provider(primary="nvidia") is None
+
+
+def test_llm_fallback_enabled_defaults_to_true_when_unset(monkeypatch):
+    """Sanity check on the flag's own default: with the variable entirely
+    unset, fallback selection behaves exactly as before this task (an
+    explicit opt-out, not an opt-in, so nothing regresses for deployments
+    that never set it)."""
+    monkeypatch.delenv("LLM_FALLBACK_ENABLED", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-primary-key", gemini="google-key", openai=None)
+
+    assert get_fallback_provider(primary="nvidia") == "gemini"
+
+
+def test_nvidia_only_mode_fails_closed_without_ever_requesting_gemini(monkeypatch):
+    """
+    End-to-end: with LLM_FALLBACK_ENABLED=false, a failing NVIDIA primary
+    call must raise its OWN classified error directly - get_llm() must
+    never be called for a fallback provider at all, proving no Gemini
+    request is attempted (not just that none succeeds).
+    """
+    monkeypatch.setenv("LLM_FALLBACK_ENABLED", "false")
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-primary-key", gemini="google-key", openai="openai-key")
+
+    primary = FakeProviderLLM(provider="nvidia", failure=TimeoutError("Request timed out after 30.0 seconds"))
+
+    def unexpected_get_llm(provider=None, **kw):
+        raise AssertionError(
+            f"get_llm() must not be called for a fallback provider when "
+            f"LLM_FALLBACK_ENABLED=false (provider={provider!r})"
+        )
+
+    monkeypatch.setattr("backend.services.llm.get_llm", unexpected_get_llm)
+
+    with pytest.raises(LLMTimeoutError) as exc_info:
+        invoke_structured(primary, RoutingDecision, "Prompt")
+
+    assert exc_info.value.provider == "nvidia"
+    assert primary.invocations == 1
+
+
+# 22c. Groq as credentialed fallback for NVIDIA (real provider selection,
+# real structured-output contract - the actual network calls are still
+# faked here via FakeProviderLLM; the real, live NVIDIA+Groq network smoke
+# test was run manually as a one-off script, not committed to this suite -
+# see this session's final report for its result).
+def test_get_fallback_provider_prefers_groq_for_nvidia_primary(monkeypatch):
+    """
+    get_fallback_provider(primary="nvidia") must select 'groq' first when
+    GROQ_API_KEY is configured, ahead of gemini/openai - Groq is the
+    intended, preferred fallback for a capacity-exhausted NVIDIA primary.
+    """
+    monkeypatch.delenv("LLM_FALLBACK_ENABLED", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-key", gemini="google-key", openai="openai-key", groq="gsk-key")
+
+    assert get_fallback_provider(primary="nvidia") == "groq"
+
+
+def test_nvidia_retry_exhausted_falls_back_to_groq_with_structured_result(monkeypatch):
+    """
+    End-to-end: once NVIDIA's own bounded capacity retries are exhausted,
+    invoke_structured() must fall back to Groq and return the SAME
+    structured RoutingDecision contract the caller expects - Groq fallback
+    is not a special case requiring different caller-side handling.
+    """
+    from backend.core.config import NVIDIA_MAX_RETRIES
+
+    primary = FakeProviderLLM(provider="nvidia", failure=httpx.NetworkError("503 Service Unavailable"))
+    fallback = FakeProviderLLM(
+        provider="groq",
+        result=RoutingDecision(
+            task_type=TaskType.BUG_FIX,
+            requires_planning=False,
+            requires_knowledge=False,
+            reasoning="Groq fallback classified this correctly",
+        ),
+    )
+
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: "groq")
+    monkeypatch.setattr("backend.services.llm.get_llm", lambda provider=None, **kw: fallback if provider == "groq" else primary)
+
+    result = invoke_structured(primary, RoutingDecision, "Fix broken endpoint")
+
+    assert result.task_type == TaskType.BUG_FIX
+    assert primary.invocations == NVIDIA_MAX_RETRIES + 1
+    assert fallback.invocations == 1
+
+
+def test_nvidia_retry_exhausted_no_groq_credential_fails_closed(monkeypatch):
+    """
+    With no GROQ_API_KEY (and no other fallback credential) configured,
+    NVIDIA's own retries must still exhaust and then fail closed with its
+    classified error - never crash, never fabricate a RoutingDecision.
+    """
+    from backend.core.config import NVIDIA_MAX_RETRIES
+
+    monkeypatch.delenv("LLM_FALLBACK_ENABLED", raising=False)
+    monkeypatch.delenv("LLM_FALLBACK_PROVIDER", raising=False)
+    _set_provider_credentials(monkeypatch, nvidia="nvapi-key", gemini=None, openai=None, groq=None)
+
+    primary = FakeProviderLLM(provider="nvidia", failure=httpx.NetworkError("503 Service Unavailable"))
+
+    with pytest.raises(LLMTransientError) as exc_info:
+        invoke_structured(primary, RoutingDecision, "Prompt")
+
+    assert exc_info.value.provider == "nvidia"
+    assert primary.invocations == NVIDIA_MAX_RETRIES + 1
+
+
+def test_groq_malformed_response_still_classified_and_fallback_eligible(monkeypatch):
+    """
+    Existing malformed-response handling must remain active for Groq: an
+    empty/unparseable Groq completion is classified LLMMalformedResponseError,
+    not silently treated as success or crashed on.
+    """
+    groq_fake = FakeEmptyCompletionLLM(provider="groq", content="")
+
+    with pytest.raises(LLMMalformedResponseError):
+        _invoke_single_provider(groq_fake, RoutingDecision, "Prompt")
+
+
+def test_groq_failure_classified_correctly_no_fabricated_result(monkeypatch):
+    """
+    A Groq failure (e.g. auth error) must be classified correctly and must
+    never fabricate a RoutingDecision - the caller gets a structured error,
+    not a guessed/default result.
+    """
+    groq_fake = FakeProviderLLM(provider="groq", failure=Exception("401 Unauthorized: invalid api key"))
+
+    with pytest.raises(LLMAuthenticationError):
+        _invoke_single_provider(groq_fake, RoutingDecision, "Prompt")
+
+
+def test_groq_api_key_never_appears_in_telemetry_or_errors(monkeypatch):
+    """
+    Security: a Groq failure message that happens to echo a credential-
+    shaped string must never leak into the raised error's own message
+    beyond what the (test-simulated) provider SDK itself included - and
+    must never appear in the PROVIDER_FALLBACK telemetry event, which only
+    records pre-known-safe fields (provider names, failure category,
+    attempt number), never raw exception text.
+    """
+    fake_groq_key = "gsk_shouldneverappearinlogs00000000000000"
+    primary = FakeProviderLLM(
+        provider="nvidia",
+        failure=httpx.NetworkError(f"503 Service Unavailable (leaked key {fake_groq_key})"),
+    )
+    fallback = FakeProviderLLM(
+        provider="groq",
+        result=RoutingDecision(
+            task_type=TaskType.GENERAL,
+            requires_planning=False,
+            requires_knowledge=False,
+            reasoning="ok",
+        ),
+    )
+
+    recorded_events = []
+    original_on_fallback = telemetry_collector.on_provider_fallback
+
+    def mock_on_fallback(**kwargs):
+        recorded_events.append(kwargs)
+        original_on_fallback(**kwargs)
+
+    monkeypatch.setattr(telemetry_collector, "on_provider_fallback", mock_on_fallback)
+    monkeypatch.setattr("backend.services.llm.get_fallback_provider", lambda *a, **kw: "groq")
+    monkeypatch.setattr("backend.services.llm.get_llm", lambda provider=None, **kw: fallback)
+
+    invoke_structured(primary, RoutingDecision, "Some prompt")
+
+    assert len(recorded_events) == 1
+    event_str = str(recorded_events[0])
+    assert fake_groq_key not in event_str
+    assert "GROQ_API_KEY" not in event_str
 
 
 # 23. test_get_fallback_provider_no_credentials_returns_none (Category A)

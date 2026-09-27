@@ -172,13 +172,25 @@ class TestInvokeStructured:
         except ValueError as e:
             assert "bad schema" in str(e)
 
-    def test_empty_completion_is_malformed_not_invalid_request(self):
+    def test_empty_completion_is_malformed_not_invalid_request(self, monkeypatch):
         """
         An empty completion body (parsed=None, no parsing_error, direct
         llm.invoke() returns empty content) must be detected as
         LLMMalformedResponseError before it can reach model_validate_json("")
         and be misclassified as a non-retryable LLMInvalidRequestError.
+
+        Clears every fallback-eligible provider's credential so this test's
+        outcome depends only on the primary's own classification, not on
+        which fallback credentials happen to be present in whatever real
+        .env this suite runs against (malformed responses are fallback-
+        eligible, so an incidentally-credentialed fallback would otherwise
+        attempt a real call here with schema=dict, unrelated to this test).
         """
+        import backend.services.llm as llm_module
+        for env_name in ("GOOGLE_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY"):
+            monkeypatch.delenv(env_name, raising=False)
+            monkeypatch.setattr(llm_module, env_name, None)
+
         llm = FakeLLM(parsed=None, raw=None, direct_content="")
         with pytest.raises(LLMMalformedResponseError):
             invoke_structured(llm, dict, "prompt")

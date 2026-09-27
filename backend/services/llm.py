@@ -8,6 +8,7 @@ from backend.core.config import (
     NVIDIA_API_KEY,
     GOOGLE_API_KEY,
     OPENAI_API_KEY,
+    GROQ_API_KEY,
     validate_config,
 )
 
@@ -30,6 +31,14 @@ _DEFAULT_MODELS = {
     "nvidia": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
     "gemini": "gemini-3.6-flash",
     "openai": "gpt-4o",
+    # openai/gpt-oss-20b, hosted on Groq (not NVIDIA - same open-weight model,
+    # different infrastructure). Verified live (2026-09-27) against the
+    # installed langchain-groq==1.1.3: with_structured_output(RoutingDecision,
+    # include_raw=True) returns a correctly parsed result in <1s. The larger
+    # openai/gpt-oss-120b was tried first and rejected - it failed the exact
+    # same live request with "Tool choice is required, but model did not call
+    # a tool" (400), producing free-form JSON prose instead of a tool call.
+    "groq": "openai/gpt-oss-20b",
 }
 
 
@@ -74,6 +83,7 @@ def get_llm(provider: Optional[str] = None, timeout: Optional[float] = None):
     nvidia_key = os.getenv("NVIDIA_API_KEY", NVIDIA_API_KEY)
     google_key = os.getenv("GOOGLE_API_KEY", GOOGLE_API_KEY)
     openai_key = os.getenv("OPENAI_API_KEY", OPENAI_API_KEY)
+    groq_key = os.getenv("GROQ_API_KEY", GROQ_API_KEY)
 
     if eff_provider == "nvidia":
         from langchain_nvidia_ai_endpoints import ChatNVIDIA
@@ -125,8 +135,15 @@ def get_llm(provider: Optional[str] = None, timeout: Optional[float] = None):
         setattr(client, "_timeout", eff_timeout)
         return client
 
+    if eff_provider == "groq":
+        from langchain_groq import ChatGroq
+        client = ChatGroq(model=model, api_key=groq_key, temperature=0, timeout=eff_timeout)
+        setattr(client, "_provider", "groq")
+        setattr(client, "_timeout", eff_timeout)
+        return client
+
     raise ValueError(
-        f"Unsupported LLM_PROVIDER: '{eff_provider}'. Supported: 'nvidia', 'gemini', 'openai'."
+        f"Unsupported LLM_PROVIDER: '{eff_provider}'. Supported: 'nvidia', 'gemini', 'openai', 'groq'."
     )
 
 
@@ -145,6 +162,8 @@ def _has_provider_credentials(provider: str) -> bool:
         return bool(os.getenv("GOOGLE_API_KEY", GOOGLE_API_KEY))
     if provider == "openai":
         return bool(os.getenv("OPENAI_API_KEY", OPENAI_API_KEY))
+    if provider == "groq":
+        return bool(os.getenv("GROQ_API_KEY", GROQ_API_KEY))
     return False
 
 
@@ -153,9 +172,10 @@ def _has_provider_credentials(provider: str) -> bool:
 # table so get_fallback_provider() can walk it uniformly instead of
 # hand-rolling three near-duplicate if/else ladders.
 _FALLBACK_ORDER = {
-    "nvidia": ("gemini", "openai"),
+    "nvidia": ("groq", "gemini", "openai"),
     "gemini": ("nvidia", "openai"),
     "openai": ("nvidia", "gemini"),
+    "groq": ("nvidia", "gemini", "openai"),
 }
 
 
